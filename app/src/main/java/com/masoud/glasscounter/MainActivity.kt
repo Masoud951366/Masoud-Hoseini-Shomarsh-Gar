@@ -302,7 +302,6 @@ private object GlassEstimator {
         val profile = FloatArray(w)
         for (x in 3 until w - 3) {
             val v = FloatArray(bands) { band[it][x] }.sorted()
-            profile[x] = (v[2] + band.indices.sumOf { 0.0 }.toFloat()) / 1f
             profile[x] = v[2]
         }
         val smooth = FloatArray(w)
