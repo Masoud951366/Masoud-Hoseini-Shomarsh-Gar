@@ -1,103 +1,188 @@
 package com.masoud.glasscounter
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
-import android.graphics.Bitmap
-import android.graphics.BitmapFactory
+import android.graphics.*
+import android.hardware.Sensor
+import android.hardware.SensorEvent
+import android.hardware.SensorEventListener
+import android.hardware.SensorManager
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.view.Gravity
+import android.view.View
 import android.view.ViewGroup
-import android.widget.Button
-import android.widget.LinearLayout
-import android.widget.TextView
+import android.widget.*
 import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.camera.core.CameraSelector
-import androidx.camera.core.ImageCapture
-import androidx.camera.core.ImageCaptureException
-import androidx.camera.core.Preview
+import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import java.io.File
-import kotlin.math.abs
-import kotlin.math.max
+import kotlin.math.sqrt
 
-class MainActivity : ComponentActivity() {
-    private lateinit var previewView: PreviewView
+class MainActivity : ComponentActivity(), SensorEventListener {
+    private lateinit var root: LinearLayout
     private lateinit var status: TextView
     private lateinit var countView: TextView
+    private lateinit var previewView: PreviewView
+    private lateinit var aim: AimOverlay
+    private lateinit var sensorManager: SensorManager
     private var imageCapture: ImageCapture? = null
+    private var cameraStarted = false
+    private var stableSince = 0L
+    private var lastCapture = 0L
+    private var stable = false
+    private val samples = ArrayDeque<FloatArray>()
+    private val handler = Handler(Looper.getMainLooper())
+    private val prefs by lazy { getSharedPreferences("glass_counter", Context.MODE_PRIVATE) }
 
     private val permission = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) startCamera() else status.text = "برای استفاده، اجازه دوربین را فعال کنید."
+        if (granted) startCamera() else showMessage("برای شمارش با دوربین، مجوز دوربین لازم است.")
+    }
+    private val gallery = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) {
+            try {
+                val bitmap = contentResolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it) }
+                if (bitmap != null) showResult(bitmap) else showMessage("خواندن عکس ممکن نشد.")
+            } catch (e: Exception) { showMessage("خطا در باز کردن عکس: ${e.localizedMessage}") }
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val root = LinearLayout(this).apply {
+        sensorManager = getSystemService(Context.SENSOR_SERVICE) as SensorManager
+        showHome()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        sensorManager.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)?.also {
+            sensorManager.registerListener(this, it, SensorManager.SENSOR_DELAY_UI)
+        }
+    }
+
+    override fun onPause() {
+        super.onPause()
+        sensorManager.unregisterListener(this)
+    }
+
+    private fun basePage(titleText: String): LinearLayout {
+        root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
-            setPadding(20, 24, 20, 20)
             gravity = Gravity.CENTER_HORIZONTAL
-            setBackgroundColor(0xFF101820.toInt())
+            setPadding(22, 26, 22, 22)
+            setBackgroundColor(Color.rgb(15, 27, 38))
         }
         val title = TextView(this).apply {
-            text = "شمارشگر شیشه"
-            textSize = 25f
-            setTextColor(0xFFFFFFFF.toInt())
-            gravity = Gravity.CENTER
+            text = titleText; textSize = 25f; gravity = Gravity.CENTER
+            setTextColor(Color.WHITE); setPadding(8, 10, 8, 18)
         }
+        root.addView(title, LinearLayout.LayoutParams(-1, -2))
+        setContentView(root)
+        return root
+    }
+
+    private fun addButton(label: String, action: () -> Unit) {
+        val b = Button(this).apply { text = label; textSize = 16f; setOnClickListener { action() } }
+        root.addView(b, LinearLayout.LayoutParams(-1, -2).apply { bottomMargin = 8 })
+    }
+
+    private fun addText(text: String, size: Float = 16f) {
+        root.addView(TextView(this).apply {
+            this.text = text; textSize = size; gravity = Gravity.CENTER
+            setTextColor(Color.WHITE); setPadding(8, 8, 8, 14)
+        }, LinearLayout.LayoutParams(-1, -2))
+    }
+
+    private fun showHome() {
+        basePage("شمارشگر شیشه\nMASOUD HOSEINI")
+        addText("سامانه کمکی تشخیص و شمارش جام‌های شیشه‌ای", 16f)
+        addButton("شروع شمارش با دوربین") { openCamera() }
+        addButton("شمارش از روی عکس گالری") { gallery.launch("image/*") }
+        addButton("آخرین نتایج") { showHistory() }
+        addButton("تنظیمات شمارش") { showSettings() }
+        addButton("ارتباط با ما") { showContact() }
+        addText("نسخه آزمایشی — نتیجه باید با شمارش واقعی کنترل شود.", 12f)
+    }
+
+    private fun openCamera() {
+        basePage("دوربین و نشانگر هدف")
         status = TextView(this).apply {
-            text = "دوربین را روبه‌روی ردیف شیشه‌ها بگیرید."
-            textSize = 15f
-            setTextColor(0xFFE0E7EF.toInt())
-            gravity = Gravity.CENTER
-            setPadding(8, 12, 8, 12)
+            text = "گوشی را آرام حرکت بدهید و نشانگر را روی بخش موردنظر قرار دهید."
+            textSize = 14f; gravity = Gravity.CENTER; setTextColor(Color.WHITE); setPadding(6, 8, 6, 8)
         }
         previewView = PreviewView(this).apply {
             scaleType = PreviewView.ScaleType.FILL_CENTER
             implementationMode = PreviewView.ImplementationMode.COMPATIBLE
         }
+        aim = AimOverlay(this)
+        val cameraFrame = FrameLayout(this)
+        cameraFrame.addView(previewView, FrameLayout.LayoutParams(-1, -1))
+        cameraFrame.addView(aim, FrameLayout.LayoutParams(-1, -1))
+        root.addView(status, LinearLayout.LayoutParams(-1, -2))
+        root.addView(cameraFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         countView = TextView(this).apply {
-            text = "تعداد تخمینی: —"
-            textSize = 23f
-            setTextColor(0xFF7CFFB2.toInt())
-            gravity = Gravity.CENTER
-            setPadding(8, 16, 8, 16)
+            text = "شمارش پس از ثبت تصویر نمایش داده می‌شود."
+            textSize = 17f; gravity = Gravity.CENTER; setTextColor(Color.GREEN); setPadding(8, 12, 8, 12)
         }
-        val capture = Button(this).apply {
-            text = "عکس بگیر و شمارش آزمایشی کن"
-            textSize = 17f
-            setOnClickListener { takePhoto() }
-        }
-        root.addView(title, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(status, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(previewView, LinearLayout.LayoutParams(-1, 0, 1f))
-        root.addView(countView, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
-        root.addView(capture, LinearLayout.LayoutParams(-1, ViewGroup.LayoutParams.WRAP_CONTENT))
-        setContentView(root)
-
+        root.addView(countView, LinearLayout.LayoutParams(-1, -2))
+        addButton("ثبت عکس دستی") { takePhoto() }
+        addButton("بازگشت به منو") { showHome() }
+        cameraStarted = false
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) startCamera()
         else permission.launch(Manifest.permission.CAMERA)
     }
 
     private fun startCamera() {
-        val providerFuture = ProcessCameraProvider.getInstance(this)
-        providerFuture.addListener({
-            val provider = providerFuture.get()
+        val future = ProcessCameraProvider.getInstance(this)
+        future.addListener({
+            val provider = future.get()
             val preview = Preview.Builder().build().also { it.setSurfaceProvider(previewView.surfaceProvider) }
-            imageCapture = ImageCapture.Builder()
-                .setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY)
-                .build()
+            imageCapture = ImageCapture.Builder().setCaptureMode(ImageCapture.CAPTURE_MODE_MAXIMIZE_QUALITY).build()
             try {
                 provider.unbindAll()
                 provider.bindToLifecycle(this, CameraSelector.DEFAULT_BACK_CAMERA, preview, imageCapture)
-                status.text = "آماده؛ گوشی را روبه‌روی شیشه‌ها ثابت نگه دارید."
-            } catch (e: Exception) {
-                status.text = "خطا در راه‌اندازی دوربین: ${e.localizedMessage}"
-            }
+                cameraStarted = true
+                status.text = "نشانگر وسط تصویر است. با ثابت ماندن گوشی، عکس خودکار ثبت می‌شود."
+            } catch (e: Exception) { status.text = "خطای دوربین: ${e.localizedMessage}" }
         }, ContextCompat.getMainExecutor(this))
     }
+
+    override fun onSensorChanged(event: SensorEvent) {
+        if (event.sensor.type != Sensor.TYPE_ACCELEROMETER || !::aim.isInitialized || !cameraStarted) return
+        val v = floatArrayOf(event.values[0], event.values[1], event.values[2])
+        samples.addLast(v)
+        while (samples.size > 18) samples.removeFirst()
+        if (samples.size < 15) return
+        val means = FloatArray(3)
+        samples.forEach { for (i in 0..2) means[i] += it[i] / samples.size }
+        var variance = 0f
+        samples.forEach { for (i in 0..2) variance += (it[i] - means[i]) * (it[i] - means[i]) / samples.size }
+        val gravity = sqrt(means.sumOf { (it * it).toDouble() }).toFloat()
+        val now = System.currentTimeMillis()
+        stable = variance < 0.055f && gravity in 8.4f..11.2f
+        aim.setStable(stable)
+        if (stable) {
+            if (stableSince == 0L) stableSince = now
+            val elapsed = now - stableSince
+            if (elapsed >= 1800 && now - lastCapture > 5000) {
+                lastCapture = now
+                stableSince = 0L
+                handler.post { if (cameraStarted) takePhoto() }
+            } else {
+                status.text = "گوشی ثابت است؛ ثبت خودکار تا ${((1800 - elapsed).coerceAtLeast(0) / 1000f)} ثانیه دیگر."
+            }
+        } else {
+            stableSince = 0L
+            status.text = "حرکت آرام؛ وقتی گوشی ثابت شود نشانگر سبز و عکس خودکار ثبت می‌شود."
+        }
+    }
+
+    override fun onAccuracyChanged(sensor: Sensor?, accuracy: Int) = Unit
 
     private fun takePhoto() {
         val capture = imageCapture ?: return
@@ -109,63 +194,114 @@ class MainActivity : ComponentActivity() {
             object : ImageCapture.OnImageSavedCallback {
                 override fun onImageSaved(output: ImageCapture.OutputFileResults) {
                     val bitmap = BitmapFactory.decodeFile(file.absolutePath)
-                    if (bitmap == null) {
-                        status.text = "خواندن تصویر ناموفق بود."
-                        return
-                    }
-                    val estimate = GlassEstimator.estimate(bitmap)
-                    countView.text = "تعداد تخمینی: $estimate"
-                    status.text = "این نسخه آزمایشی است؛ نتیجه را با شمارش دستی بررسی کنید."
+                    if (bitmap != null) showResult(bitmap) else status.text = "خواندن عکس ناموفق بود."
                 }
-                override fun onError(exception: ImageCaptureException) {
-                    status.text = "خطا در عکس‌برداری: ${exception.message}"
-                }
+                override fun onError(exception: ImageCaptureException) { status.text = "خطا در عکس‌برداری: ${exception.message}" }
             }
         )
     }
+
+    private fun showResult(bitmap: Bitmap) {
+        val estimate = GlassEstimator.estimate(bitmap)
+        val old = prefs.getString("history", "") ?: ""
+        val entry = "${java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())} — تخمین: $estimate"
+        prefs.edit().putString("history", (entry + "\n" + old).take(4000)).apply()
+        basePage("نتیجه تحلیل تصویر")
+        addText("تعداد تخمینی لبه/جام: $estimate", 23f)
+        addText("این عدد شمارش قطعی جام‌ها نیست. انعکاس، شیارهای سطح و جام‌های عقب‌وجلو ممکن است خطا ایجاد کنند.", 15f)
+        addText("برای نتیجه معتبر، تصویر باید در شرایط نوری و زاویه‌های مختلف با تعداد واقعی برچسب‌گذاری و الگوریتم اختصاصی آموزش داده شود.", 13f)
+        addButton("شمارش دوباره با دوربین") { openCamera() }
+        addButton("انتخاب عکس دیگر") { gallery.launch("image/*") }
+        addButton("بازگشت به منو") { showHome() }
+    }
+
+    private fun showHistory() {
+        basePage("سوابق شمارش")
+        addText(prefs.getString("history", "هنوز نتیجه‌ای ثبت نشده است.") ?: "هنوز نتیجه‌ای ثبت نشده است.", 14f)
+        addButton("پاک کردن سوابق") { prefs.edit().remove("history").apply(); showHistory() }
+        addButton("بازگشت") { showHome() }
+    }
+
+    private fun showContact() {
+        basePage("ارتباط با ما")
+        addText("طراح و توسعه‌دهنده\nمهندس مسعود حسینی", 21f)
+        addText("واحد بازرسی شیشه\nکارخانه شیشه فلوت کاویان\nگروه صنعتی کاوه")
+        addText("همراه: 09152191509\nهمراه: 09352705301\nایمیل: masoudhoseini.9565@gmail.com", 16f)
+        addButton("ارسال ایمیل") {
+            val intent = android.content.Intent(android.content.Intent.ACTION_SENDTO).apply {
+                data = android.net.Uri.parse("mailto:masoudhoseini.9565@gmail.com")
+                putExtra(android.content.Intent.EXTRA_SUBJECT, "شمارشگر شیشه")
+            }
+            try { startActivity(intent) } catch (_: Exception) { showMessage("برنامه ایمیل در گوشی پیدا نشد.") }
+        }
+        addButton("بازگشت") { showHome() }
+    }
+
+    private fun showSettings() {
+        basePage("تنظیمات")
+        addText("ثبت خودکار پس از حدود ۱٫۸ ثانیه ثبات حسگر حرکتی انجام می‌شود. نشانگر سبز یعنی حرکت گوشی کم است؛ این نشانگر تشخیص محل جام نیست.")
+        addText("حساسیت تشخیص جام در این نسخه هنوز قابل کالیبره‌کردن صنعتی نیست.")
+        addButton("بازگشت") { showHome() }
+    }
+
+    private fun showMessage(message: String) {
+        android.app.AlertDialog.Builder(this).setMessage(message).setPositiveButton("باشه", null).show()
+    }
 }
 
-/**
- * Conservative visual estimate based on repeated vertical brightness transitions.
- * It is a prototype heuristic, not a trained glass detector.
- */
+private class AimOverlay(context: Context) : View(context) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 4f; style = Paint.Style.STROKE }
+    private var steady = false
+    fun setStable(value: Boolean) { steady = value; invalidate() }
+    override fun onDraw(canvas: Canvas) {
+        super.onDraw(canvas)
+        paint.color = if (steady) Color.GREEN else Color.YELLOW
+        val x = width / 2f; val y = height / 2f; val r = 34f
+        canvas.drawCircle(x, y, r, paint)
+        canvas.drawLine(x - 58, y, x - 15, y, paint)
+        canvas.drawLine(x + 15, y, x + 58, y, paint)
+        canvas.drawLine(x, y - 58, x, y - 15, paint)
+        canvas.drawLine(x, y + 15, x, y + 58, paint)
+    }
+}
+
 private object GlassEstimator {
+    // Experimental edge-density estimate only; not a trained pane detector.
     fun estimate(bitmap: Bitmap): Int {
         val w = bitmap.width
         val h = bitmap.height
         if (w < 20 || h < 20) return 0
-        val xStep = max(1, w / 700)
-        val yStart = h / 5
-        val yEnd = h * 4 / 5
-        val profile = IntArray(w)
-        var x = 1
-        while (x < w - 1) {
-            var score = 0L
-            var samples = 0
-            var y = yStart
-            while (y < yEnd) {
-                val left = bitmap.getPixel(x - 1, y)
-                val right = bitmap.getPixel(x + 1, y)
-                val l = (android.graphics.Color.red(left) * 299 + android.graphics.Color.green(left) * 587 + android.graphics.Color.blue(left) * 114) / 1000
-                val r = (android.graphics.Color.red(right) * 299 + android.graphics.Color.green(right) * 587 + android.graphics.Color.blue(right) * 114) / 1000
-                score += abs(r - l)
-                samples++
-                y += max(2, h / 180)
+        val y0 = h / 5
+        val y1 = h * 4 / 5
+        val scores = FloatArray(w)
+        val yStep = maxOf(2, h / 220)
+        for (x in 2 until w - 2) {
+            var sum = 0L
+            var n = 0
+            var y = y0
+            while (y < y1) {
+                val a = bitmap.getPixel(x - 1, y)
+                val b = bitmap.getPixel(x + 1, y)
+                val la = (Color.red(a) * 299 + Color.green(a) * 587 + Color.blue(a) * 114) / 1000
+                val lb = (Color.red(b) * 299 + Color.green(b) * 587 + Color.blue(b) * 114) / 1000
+                sum += kotlin.math.abs(lb - la)
+                n++
+                y += yStep
             }
-            profile[x] = if (samples == 0) 0 else (score / samples).toInt()
-            x += xStep
+            scores[x] = if (n == 0) 0f else sum.toFloat() / n
         }
-        val smoothed = IntArray(w)
-        for (i in 2 until w - 2) smoothed[i] = (profile[i-2] + profile[i-1] + profile[i] + profile[i+1] + profile[i+2]) / 5
-        val sorted = smoothed.filter { it > 0 }.sorted()
+        val sorted = scores.drop(2).dropLast(2).sorted()
         if (sorted.isEmpty()) return 0
-        val threshold = max(18, sorted[sorted.size * 3 / 4] * 2 / 3)
-        val peaks = ArrayList<Int>()
-        for (i in 3 until w - 3) {
-            if (smoothed[i] >= threshold && smoothed[i] >= smoothed[i-1] && smoothed[i] > smoothed[i+1] &&
-                (peaks.isEmpty() || i - peaks.last() > w / 80)) peaks.add(i)
+        val threshold = maxOf(20f, sorted[sorted.size * 3 / 4] * 0.8f)
+        val minGap = maxOf(3, w / 100)
+        var peaks = 0
+        var last = -minGap
+        for (x in 3 until w - 3) {
+            if (scores[x] > threshold && scores[x] >= scores[x - 1] && scores[x] > scores[x + 1] && x - last >= minGap) {
+                peaks++
+                last = x
+            }
         }
-        // A glass commonly contributes two prominent side edges; report paired edges.
-        return ((peaks.size + 1) / 2).coerceIn(0, 250)
+        return (peaks / 2).coerceIn(0, 250)
     }
 }
