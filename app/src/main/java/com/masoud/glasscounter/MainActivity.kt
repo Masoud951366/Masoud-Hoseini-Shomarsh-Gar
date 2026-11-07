@@ -266,42 +266,61 @@ private class AimOverlay(context: Context) : View(context) {
 }
 
 private object GlassEstimator {
-    // Experimental edge-density estimate only; not a trained pane detector.
+    // Experimental multi-band vertical-edge detector. A line must remain visible
+    // across several image bands to reduce errors from isolated reflections.
     fun estimate(bitmap: Bitmap): Int {
-        val w = bitmap.width
-        val h = bitmap.height
-        if (w < 20 || h < 20) return 0
-        val y0 = h / 5
-        val y1 = h * 4 / 5
-        val scores = FloatArray(w)
-        val yStep = maxOf(2, h / 220)
-        for (x in 2 until w - 2) {
-            var sum = 0L
-            var n = 0
-            var y = y0
-            while (y < y1) {
-                val a = bitmap.getPixel(x - 1, y)
-                val b = bitmap.getPixel(x + 1, y)
-                val la = (Color.red(a) * 299 + Color.green(a) * 587 + Color.blue(a) * 114) / 1000
-                val lb = (Color.red(b) * 299 + Color.green(b) * 587 + Color.blue(b) * 114) / 1000
-                sum += kotlin.math.abs(lb - la)
-                n++
-                y += yStep
+        val w0 = bitmap.width
+        val h0 = bitmap.height
+        if (w0 < 40 || h0 < 80) return 0
+        val w = minOf(800, w0)
+        val h = maxOf(120, (h0 * w / w0))
+        val image = Bitmap.createScaledBitmap(bitmap, w, h, true)
+        val bands = 5
+        val band = Array(bands) { FloatArray(w) }
+        val y0 = h / 12
+        val y1 = h * 11 / 12
+        for (b in 0 until bands) {
+            val top = y0 + (y1 - y0) * b / bands
+            val bottom = y0 + (y1 - y0) * (b + 1) / bands
+            val step = maxOf(2, (bottom - top) / 160)
+            for (x in 2 until w - 2) {
+                var total = 0f
+                var n = 0
+                var y = top
+                while (y < bottom) {
+                    val p = image.getPixel(x - 1, y)
+                    val q = image.getPixel(x + 1, y)
+                    val lp = (Color.red(p) * 299 + Color.green(p) * 587 + Color.blue(p) * 114) / 1000f
+                    val lq = (Color.red(q) * 299 + Color.green(q) * 587 + Color.blue(q) * 114) / 1000f
+                    total += kotlin.math.abs(lq - lp)
+                    n++
+                    y += step
+                }
+                band[b][x] = if (n == 0) 0f else total / n
             }
-            scores[x] = if (n == 0) 0f else sum.toFloat() / n
         }
-        val sorted = scores.drop(2).dropLast(2).sorted()
-        if (sorted.isEmpty()) return 0
-        val threshold = maxOf(20f, sorted[sorted.size * 3 / 4] * 0.8f)
-        val minGap = maxOf(3, w / 100)
-        var peaks = 0
-        var last = -minGap
+        val profile = FloatArray(w)
         for (x in 3 until w - 3) {
-            if (scores[x] > threshold && scores[x] >= scores[x - 1] && scores[x] > scores[x + 1] && x - last >= minGap) {
-                peaks++
-                last = x
-            }
+            val v = FloatArray(bands) { band[it][x] }.sorted()
+            profile[x] = (v[2] + band.indices.sumOf { 0.0 }.toFloat()) / 1f
+            profile[x] = v[2]
         }
-        return (peaks / 2).coerceIn(0, 250)
+        val smooth = FloatArray(w)
+        for (x in 3 until w - 3) {
+            smooth[x] = (profile[x-2] + 2f*profile[x-1] + 3f*profile[x] + 2f*profile[x+1] + profile[x+2]) / 9f
+        }
+        val values = smooth.drop(3).dropLast(3).sorted()
+        if (values.isEmpty()) { image.recycle(); return 0 }
+        val median = values[values.size / 2]
+        val dev = values.map { kotlin.math.abs(it - median) }.sorted()
+        val threshold = maxOf(median + dev[dev.size / 2] * 1.25f, values[values.size * 65 / 100])
+        val minGap = maxOf(3, w / 220)
+        val candidates = (4 until w - 4).filter {
+            smooth[it] >= threshold && smooth[it] >= smooth[it-1] && smooth[it] > smooth[it+1]
+        }.sortedByDescending { smooth[it] }
+        val chosen = ArrayList<Int>()
+        for (x in candidates) if (chosen.none { kotlin.math.abs(it - x) < minGap }) chosen.add(x)
+        image.recycle()
+        return chosen.size.coerceAtMost(200)
     }
 }
