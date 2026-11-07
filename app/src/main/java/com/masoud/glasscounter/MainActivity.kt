@@ -75,7 +75,7 @@ class MainActivity : ComponentActivity(), SensorEventListener {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(22, 26, 22, 22)
-            setBackgroundColor(Color.rgb(15, 27, 38))
+            setBackgroundResource(R.drawable.app_background)
         }
         val title = TextView(this).apply {
             text = titleText; textSize = 25f; gravity = Gravity.CENTER
