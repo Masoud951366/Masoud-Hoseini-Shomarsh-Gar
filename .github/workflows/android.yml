@@ -1,7 +1,7 @@
 name: Build Android APK
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "feature/glass-boundary-pairing-v1" ]
   workflow_dispatch:
 permissions:
   contents: read
