@@ -202,15 +202,17 @@ class MainActivity : ComponentActivity(), SensorEventListener {
     }
 
     private fun showResult(bitmap: Bitmap) {
-        val estimate = GlassEstimator.estimate(bitmap)
+        val result = GlassCountingEngine.analyze(bitmap)
         val old = prefs.getString("history", "") ?: ""
-        val entry = "${java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())} — تخمین: $estimate"
+        val stamp = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
+        val entry = "$stamp — لبه‌های پایدار: ${result.detectedEdges} — اطمینان الگوریتم: ${(result.confidence * 100).toInt()}٪"
         prefs.edit().putString("history", (entry + "\n" + old).take(4000)).apply()
-        basePage("نتیجه تحلیل تصویر")
-        addText("تعداد تخمینی لبه/جام: $estimate", 23f)
-        addText("این عدد شمارش قطعی جام‌ها نیست. انعکاس، شیارهای سطح و جام‌های عقب‌وجلو ممکن است خطا ایجاد کنند.", 15f)
-        addText("برای نتیجه معتبر، تصویر باید در شرایط نوری و زاویه‌های مختلف با تعداد واقعی برچسب‌گذاری و الگوریتم اختصاصی آموزش داده شود.", 13f)
-        addButton("شمارش دوباره با دوربین") { openCamera() }
+        basePage("گزارش تحلیل تصویر")
+        addText("لبه‌های پایدار شناسایی‌شده: ${result.detectedEdges}", 22f)
+        addText("امتیاز پایداری تصویری: ${(result.confidence * 100).toInt()}٪", 18f)
+        addText("توجه: این نسخه هنوز تعداد جام‌ها را محاسبه نمی‌کند؛ تعداد خطوط به‌اشتباه به‌عنوان تعداد جام نمایش داده نمی‌شود.", 16f)
+        addText("بازتاب نور، هم‌پوشانی و جابه‌جایی جام‌ها هنوز نیازمند مدل اختصاصی و اعتبارسنجی روی تصاویر واقعی هستند.", 13f)
+        addButton("تحلیل دوباره با دوربین") { openCamera() }
         addButton("انتخاب عکس دیگر") { gallery.launch("image/*") }
         addButton("بازگشت به منو") { showHome() }
     }
@@ -265,6 +267,4 @@ private class AimOverlay(context: Context) : View(context) {
     }
 }
 
-private object GlassEstimator {
-    fun estimate(bitmap: Bitmap): Int = GlassCountingEngine.analyze(bitmap).count
-}
+
