@@ -1,7 +1,7 @@
 name: Build Android APK
 on:
   push:
-    branches: [ "main", "feature/glass-boundary-pairing-v1", "feature/stacked-glass-horizontal-consensus-v2" ]
+    branches: [ "main", "feature/glass-boundary-pairing-v1", "feature/stacked-glass-horizontal-consensus-v2", "feature/sequence-lattice-engine-v3" ]
   workflow_dispatch:
 permissions:
   contents: read
