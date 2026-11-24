@@ -77,23 +77,31 @@ internal object GlassSequenceAnalyzerV3 {
             var bestScore = Float.NEGATIVE_INFINITY
             var secondScore = Float.NEGATIVE_INFINITY
 
+            // First demand true periodic similarity at a candidate lag. A mere set of
+            // strong unrelated reflections should not win just because some rows are bright.
             for (pitch in minPitch..maxPitch) {
-                val maxPhase = min(pitch, roi)
-                for (phase in 0 until maxPhase) {
+                val periodicity = autocorrelation(consensus, pitch)
+                if (periodicity <= 0.04f) continue
+                var phase = 0
+                var phaseScore = Float.NEGATIVE_INFINITY
+                for (candidatePhase in 0 until pitch) {
                     var sum = 0f
-                    var count = 0
-                    var y = phase
+                    var n = 0
+                    var y = candidatePhase
                     while (y < roi) {
                         sum += consensus[y]
-                        count++
+                        n++
                         y += pitch
                     }
-                    if (count < 8) continue
-                    val mean = sum / count
-                    // Reward evidence at the proposed boundaries, but require a reasonably
-                    // complete sequence rather than one or two unusually strong reflections.
-                    val coverage = count.toFloat() / (roi.toFloat() / pitch)
-                    val score = mean * (0.7f + 0.3f * coverage)
+                    if (n < 8) continue
+                    val score = sum / n
+                    if (score > phaseScore) {
+                        phaseScore = score
+                        phase = candidatePhase
+                    }
+                }
+                if (phaseScore.isFinite()) {
+                    val score = periodicity * 0.7f + phaseScore * 0.3f
                     if (score > bestScore) {
                         secondScore = bestScore
                         bestScore = score
@@ -102,7 +110,6 @@ internal object GlassSequenceAnalyzerV3 {
                     } else if (score > secondScore) secondScore = score
                 }
             }
-
             if (bestPitch == 0) return fail("الگوی تکرارشونده قابل اتکا پیدا نشد.")
             val rows = ArrayList<Int>()
             var y = bestPhase
@@ -126,6 +133,31 @@ internal object GlassSequenceAnalyzerV3 {
         } finally {
             if (image !== bitmap) image.recycle()
         }
+    }
+ 
+    private fun autocorrelation(values: FloatArray, lag: Int): Float {
+        if (lag <= 0 || lag >= values.size / 2) return -1f
+        val n = values.size - lag
+        var meanA = 0f
+        var meanB = 0f
+        for (i in 0 until n) {
+            meanA += values[i]
+            meanB += values[i + lag]
+        }
+        meanA /= n
+        meanB /= n
+        var covariance = 0f
+        var varianceA = 0f
+        var varianceB = 0f
+        for (i in 0 until n) {
+            val a = values[i] - meanA
+            val b = values[i + lag] - meanB
+            covariance += a * b
+            varianceA += a * a
+            varianceB += b * b
+        }
+        val denominator = kotlin.math.sqrt(varianceA * varianceB)
+        return if (denominator <= 1e-6f) -1f else covariance / denominator
     }
 
     private fun normalize(input: FloatArray): FloatArray {
