@@ -205,13 +205,13 @@ class MainActivity : ComponentActivity(), SensorEventListener {
         val result = GlassCountingEngine.analyze(bitmap)
         val old = prefs.getString("history", "") ?: ""
         val stamp = java.text.SimpleDateFormat("yyyy/MM/dd HH:mm", java.util.Locale.getDefault()).format(java.util.Date())
-        val entry = "$stamp — لبه‌های پایدار: ${result.detectedEdges} — اطمینان الگوریتم: ${(result.confidence * 100).toInt()}٪"
+        val entry = "$stamp — تخمین بازه‌ها: ${result.count} — مرزهای پشتیبانی‌شده: ${result.detectedEdges} — امتیاز: ${(result.confidence * 100).toInt()}٪"
         prefs.edit().putString("history", (entry + "\n" + old).take(4000)).apply()
         basePage("گزارش تحلیل تصویر")
-        addText("لبه‌های پایدار شناسایی‌شده: ${result.detectedEdges}", 22f)
-        addText("امتیاز پایداری تصویری: ${(result.confidence * 100).toInt()}٪", 18f)
-        addText("توجه: این نسخه هنوز تعداد جام‌ها را محاسبه نمی‌کند؛ تعداد خطوط به‌اشتباه به‌عنوان تعداد جام نمایش داده نمی‌شود.", 16f)
-        addText("بازتاب نور، هم‌پوشانی و جابه‌جایی جام‌ها هنوز نیازمند مدل اختصاصی و اعتبارسنجی روی تصاویر واقعی هستند.", 13f)
+        addText("تخمین اولیه تعداد جام‌ها: ${result.count}", 24f)
+        addText("مرزهای افقی پشتیبانی‌شده: ${result.detectedEdges}  |  فاصله میانه: ${result.pairSpacingPx} px", 15f)
+        addText("امتیاز سازگاری تصویری: ${(result.confidence * 100).toInt()}٪", 18f)
+        addText("این شمارش یک تخمین آزمایشی بر پایه مرزهای متوالی است؛ امتیاز بالا تضمین صحت صنعتی نیست. انعکاس و جابه‌جایی عمقی ممکن است مرز کاذب یا پنهان ایجاد کند.", 14f)
         addButton("تحلیل دوباره با دوربین") { openCamera() }
         addButton("انتخاب عکس دیگر") { gallery.launch("image/*") }
         addButton("بازگشت به منو") { showHome() }
