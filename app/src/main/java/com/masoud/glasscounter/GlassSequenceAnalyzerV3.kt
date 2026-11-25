@@ -23,7 +23,7 @@ internal object GlassSequenceAnalyzerV3 {
         val diagnostic: String
     )
 
-    private const val BANDS =  nine
+    private const val BANDS = 9
     private const val MAX_WIDTH = 1000
 
     fun analyze(bitmap: Bitmap): Result {
@@ -180,5 +180,4 @@ internal object GlassSequenceAnalyzerV3 {
 
     private fun fail(message: String) = Result(0, emptyList(), 0f, 0f, message)
 
-    private const val nine = 9
 }
