@@ -7,12 +7,25 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Multi-band edge-consensus counter.
+ * Glass-stack boundary counter (row-edge / slanted-line consensus).
  *
- * Replaces the old "find a common edge-pair distance, then greedily pair peaks"
- * approach. Each horizontal image band independently votes for persistent
- * vertical boundaries. Only boundaries supported in several separated bands
- * are retained. This is still a deterministic CV prototype, not a trained model.
+ * The previous implementation searched vertical image edges and returned the
+ * number of edge columns. A stack of upright glass sheets is represented by
+ * repeated boundaries running mostly across the image, so that orientation
+ * was fundamentally wrong for the stated capture geometry.
+ *
+ * This version:
+ *  1. Samples independent vertical image strips.
+ *  2. Finds horizontal intensity transitions inside each strip.
+ *  3. Uses a small Hough-style slope/intercept accumulator so tilted boundaries
+ *     can receive votes even when their y coordinate changes across the image.
+ *  4. Keeps only boundaries independently supported by several strips.
+ *  5. Counts intervals between consecutive boundaries (N boundaries -> N-1
+ *     visible intervals), rather than counting every edge as a glass.
+ *
+ * This is a deterministic CV prototype. It does not yet solve all reflections,
+ * occlusions, perspective, or empty-gap classification; confidence is a
+ * support score, not a calibrated probability.
  */
 internal object GlassCountingEngine {
     data class Result(
@@ -23,8 +36,13 @@ internal object GlassCountingEngine {
     )
 
     private const val MAX_WIDTH = 1400
-    private const val BAND_COUNT = 9
-    private const val MIN_SUPPORTED_BANDS = 3
+    private const val STRIP_COUNT = 13
+    private const val MIN_STRIP_SUPPORT = 4
+    private const val SLOPE_BINS = 49
+    private const val MAX_SLOPE_FRACTION = 0.12f
+
+    private data class Edge(val y: Int, val strength: Float)
+    private data class Line(val intercept: Int, val slope: Float, val votes: Int)
 
     fun analyze(source: Bitmap): Result {
         if (source.width < 80 || source.height < 100) return emptyResult()
@@ -35,133 +53,157 @@ internal object GlassCountingEngine {
             else Bitmap.createScaledBitmap(source, width, height, true)
 
         try {
-            val bands = ArrayList<IntArray>(BAND_COUNT)
-            val bandTop = height / 12
-            val bandBottom = height * 11 / 12
-            val bandHeight = max(1, (bandBottom - bandTop) / BAND_COUNT)
-            val mergeRadius = max(2, width / 500)
+            val top = height / 20
+            val bottom = height * 19 / 20
+            val usableHeight = bottom - top
+            if (usableHeight < 80) return emptyResult()
 
-            // Each band is analyzed independently so a reflection in one part
-            // of the stack cannot dominate the whole image.
-            for (band in 0 until BAND_COUNT) {
-                val y0 = bandTop + band * bandHeight
-                val y1 = if (band == BAND_COUNT - 1) bandBottom else y0 + bandHeight
-                bands.add(detectBandEdges(image, y0, y1, mergeRadius))
+            val accumulator = Array(SLOPE_BINS) { IntArray(usableHeight) }
+            val stripEdges = ArrayList<List<Edge>>(STRIP_COUNT)
+            val stripCenters = FloatArray(STRIP_COUNT)
+
+            for (strip in 0 until STRIP_COUNT) {
+                val x0 = width * strip / STRIP_COUNT
+                val x1 = width * (strip + 1) / STRIP_COUNT
+                val inset = max(1, (x1 - x0) / 10)
+                val left = min(width - 2, x0 + inset)
+                val right = max(left + 1, x1 - inset)
+                stripCenters[strip] = ((left + right) * 0.5f / width - 0.5f) * 2f
+                stripEdges.add(detectHorizontalEdges(image, left, right, top, bottom))
             }
 
-            // Cross-band consensus: one edge gets at most one vote per band.
-            val votes = IntArray(width)
-            val strength = FloatArray(width)
-            for (edges in bands) {
-                for (x in edges) {
-                    val from = max(0, x - mergeRadius)
-                    val to = min(width - 1, x + mergeRadius)
-                    var best = x
-                    for (p in from..to) {
-                        if (edgeStrength(image, p, bandTop, bandBottom) >
-                            edgeStrength(image, best, bandTop, bandBottom)) best = p
+            // Each local edge votes for all plausible line slopes. This allows
+            // the same physical, slightly tilted boundary to agree across strips.
+            for (strip in 0 until STRIP_COUNT) {
+                val xNorm = stripCenters[strip]
+                for (edge in stripEdges[strip]) {
+                    for (s in 0 until SLOPE_BINS) {
+                        val slope = slopeAt(s, usableHeight)
+                        val intercept = (edge.y - top - slope * xNorm).toInt()
+                        if (intercept in 0 until usableHeight) accumulator[s][intercept]++
                     }
-                    votes[best]++
-                    strength[best] += 1f
                 }
             }
 
-            val requiredVotes = max(MIN_SUPPORTED_BANDS, (BAND_COUNT * 0.34f).toInt())
-            val candidates = ArrayList<Int>()
-            for (x in 2 until width - 2) {
-                if (votes[x] < requiredVotes) continue
-                if (votes[x] >= votes[x - 1] && votes[x] > votes[x + 1]) {
-                    candidates.add(x)
+            val minVotes = max(MIN_STRIP_SUPPORT, (STRIP_COUNT * 0.30f).toInt())
+            val raw = ArrayList<Line>()
+            for (s in 0 until SLOPE_BINS) {
+                val row = accumulator[s]
+                for (y in 2 until usableHeight - 2) {
+                    val v = row[y]
+                    if (v < minVotes || v < row[y - 1] || v <= row[y + 1]) continue
+                    raw.add(Line(y, slopeAt(s, usableHeight), v))
                 }
             }
 
-            // Merge duplicate responses that represent the same physical line.
-            val stableLines = ArrayList<Int>()
-            for (x in candidates.sortedByDescending { votes[it] * 1000f + strength[it] }) {
-                if (stableLines.none { abs(it - x) <= mergeRadius * 2 }) stableLines.add(x)
+            // Non-maximum suppression in intercept/slope space prevents one
+            // physical boundary from being counted several times.
+            val selected = ArrayList<Line>()
+            for (candidate in raw.sortedByDescending { it.votes }) {
+                val duplicate = selected.any {
+                    abs(it.intercept - candidate.intercept) <= max(3, usableHeight / 180) &&
+                        abs(it.slope - candidate.slope) <= 0.035f
+                }
+                if (!duplicate) selected.add(candidate)
             }
-            stableLines.sort()
 
-            if (stableLines.isEmpty()) return Result(0, 0, 0, 0f)
+            // Refine support by checking how many distinct strips contain a
+            // nearby edge at the predicted y coordinate.
+            val supported = selected.mapNotNull { line ->
+                var support = 0
+                for (strip in 0 until STRIP_COUNT) {
+                    val predicted = top + line.intercept + line.slope * stripCenters[strip]
+                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(3, usableHeight / 160) }) {
+                        support++
+                    }
+                }
+                if (support >= minVotes) line.copy(votes = support) else null
+            }.sortedBy { it.intercept }
 
-            // Estimate typical separation only as a diagnostic. It is no longer
-            // used to manufacture pairs or determine the count.
-            val gaps = stableLines.zipWithNext { a, b -> b - a }.filter { it > mergeRadius * 2 }
+            // Collapse close parallel detections after refinement.
+            val boundaries = ArrayList<Line>()
+            for (line in supported) {
+                val previous = boundaries.lastOrNull()
+                if (previous == null || abs(previous.intercept - line.intercept) > max(4, usableHeight / 120)) {
+                    boundaries.add(line)
+                } else if (line.votes > previous.votes) {
+                    boundaries[boundaries.lastIndex] = line
+                }
+            }
+
+            if (boundaries.size < 2) return Result(0, boundaries.size, 0, 0f)
+
+            val gaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }
+                .filter { it > 0 }
             val spacing = if (gaps.isEmpty()) 0 else gaps.sorted()[gaps.size / 2]
+            val support = boundaries.map { it.votes.toFloat() / STRIP_COUNT }.average().toFloat()
+            val confidence = (support * min(1f, boundaries.size / 8f)).coerceIn(0f, 1f)
 
-            val support = stableLines.map { votes[it].toFloat() / BAND_COUNT }.average().toFloat()
-            val coverage = (stableLines.size.toFloat() / max(1, width / mergeRadius)).coerceIn(0f, 1f)
-            val confidence = (support * (0.65f + 0.35f * coverage)).coerceIn(0f, 1f)
-
-            return Result(stableLines.size.coerceAtMost(300), stableLines.size, spacing, confidence)
+            // A panel occupies the interval between two consecutive boundaries.
+            return Result(
+                count = (boundaries.size - 1).coerceAtMost(300),
+                detectedEdges = boundaries.size,
+                pairSpacingPx = spacing,
+                confidence = confidence
+            )
         } finally {
             if (image !== source) image.recycle()
         }
     }
 
-    private fun detectBandEdges(
+    private fun detectHorizontalEdges(
         image: Bitmap,
+        xStart: Int,
+        xEnd: Int,
         yStart: Int,
-        yEnd: Int,
-        mergeRadius: Int
-    ): IntArray {
-        val width = image.width
-        val profile = FloatArray(width)
-        val stride = max(1, (yEnd - yStart) / 180)
-        for (x in 2 until width - 2) {
-            var sum = 0f
+        yEnd: Int
+    ): List<Edge> {
+        val height = image.height
+        val profile = FloatArray(height)
+        val stepX = max(1, (xEnd - xStart) / 100)
+        for (y in yStart + 2 until yEnd - 2) {
+            var total = 0f
             var samples = 0
-            var y = yStart
-            while (y < yEnd) {
-                val left = luminance(image.getPixel(x - 2, y))
-                val right = luminance(image.getPixel(x + 2, y))
-                val centerLeft = luminance(image.getPixel(x - 1, y))
-                val centerRight = luminance(image.getPixel(x + 1, y))
-                // Combine a wider baseline with a local gradient. This reduces
-                // sensitivity to tiny pixel noise while retaining thin glass edges.
-                sum += abs(right - left) * 0.65f + abs(centerRight - centerLeft) * 0.35f
+            var x = xStart
+            while (x < xEnd) {
+                val above = luminance(image.getPixel(x, y - 2))
+                val below = luminance(image.getPixel(x, y + 2))
+                val nearAbove = luminance(image.getPixel(x, y - 1))
+                val nearBelow = luminance(image.getPixel(x, y + 1))
+                total += abs(below - above) * 0.7f + abs(nearBelow - nearAbove) * 0.3f
                 samples++
-                y += stride
+                x += stepX
             }
-            profile[x] = if (samples == 0) 0f else sum / samples
+            profile[y] = if (samples == 0) 0f else total / samples
         }
 
-        val values = profile.sliceArray(3 until width - 3).sorted()
-        if (values.isEmpty()) return intArrayOf()
+        val values = profile.sliceArray(yStart + 3 until yEnd - 3).sorted()
+        if (values.isEmpty()) return emptyList()
         val median = values[values.size / 2]
         val deviations = values.map { abs(it - median) }.sorted()
         val mad = deviations[deviations.size / 2]
-        val p82 = values[(values.size * 82 / 100).coerceIn(0, values.lastIndex)]
-        val threshold = max(median + max(1.8f, mad * 1.8f), p82)
+        val p84 = values[(values.size * 84 / 100).coerceIn(0, values.lastIndex)]
+        val threshold = max(median + max(2.0f, mad * 2.0f), p84)
 
-        val peaks = ArrayList<Int>()
-        for (x in 3 until width - 3) {
-            if (profile[x] >= threshold &&
-                profile[x] >= profile[x - 1] &&
-                profile[x] > profile[x + 1]
-            ) peaks.add(x)
+        val peaks = ArrayList<Edge>()
+        for (y in yStart + 3 until yEnd - 3) {
+            if (profile[y] >= threshold &&
+                profile[y] >= profile[y - 1] &&
+                profile[y] > profile[y + 1]
+            ) peaks.add(Edge(y, profile[y]))
         }
 
-        val selected = ArrayList<Int>()
-        for (x in peaks.sortedByDescending { profile[it] }) {
-            if (selected.none { abs(it - x) <= mergeRadius }) selected.add(x)
+        val chosen = ArrayList<Edge>()
+        val mergeDistance = max(2, image.height / 500)
+        for (edge in peaks.sortedByDescending { it.strength }) {
+            if (chosen.none { abs(it.y - edge.y) <= mergeDistance }) chosen.add(edge)
         }
-        return selected.toIntArray()
+        return chosen
     }
 
-    private fun edgeStrength(image: Bitmap, x: Int, y0: Int, y1: Int): Float {
-        if (x < 2 || x >= image.width - 2) return 0f
-        val stride = max(1, (y1 - y0) / 100)
-        var total = 0f
-        var n = 0
-        var y = y0
-        while (y < y1) {
-            total += abs(luminance(image.getPixel(x + 2, y)) -
-                luminance(image.getPixel(x - 2, y)))
-            n++
-            y += stride
-        }
-        return if (n == 0) 0f else total / n
+    private fun slopeAt(index: Int, usableHeight: Int): Float {
+        val fraction = index.toFloat() / (SLOPE_BINS - 1)
+        return (fraction * 2f - 1f) * MAX_SLOPE_FRACTION * usableHeight
     }
 
     private fun luminance(color: Int): Float =
