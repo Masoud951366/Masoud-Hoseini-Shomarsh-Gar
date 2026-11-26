@@ -7,25 +7,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Glass-stack boundary counter (row-edge / slanted-line consensus).
+ * Slanted horizontal-boundary consensus for vertically stacked glass.
+ * Independent vertical strips vote for the same physical boundary in
+ * slope/intercept space. The reported count is the number of intervals
+ * between consecutive supported boundaries (N boundaries -> N-1 intervals).
  *
- * The previous implementation searched vertical image edges and returned the
- * number of edge columns. A stack of upright glass sheets is represented by
- * repeated boundaries running mostly across the image, so that orientation
- * was fundamentally wrong for the stated capture geometry.
- *
- * This version:
- *  1. Samples independent vertical image strips.
- *  2. Finds horizontal intensity transitions inside each strip.
- *  3. Uses a small Hough-style slope/intercept accumulator so tilted boundaries
- *     can receive votes even when their y coordinate changes across the image.
- *  4. Keeps only boundaries independently supported by several strips.
- *  5. Counts intervals between consecutive boundaries (N boundaries -> N-1
- *     visible intervals), rather than counting every edge as a glass.
- *
- * This is a deterministic CV prototype. It does not yet solve all reflections,
- * occlusions, perspective, or empty-gap classification; confidence is a
- * support score, not a calibrated probability.
+ * This remains a deterministic CV prototype, not a trained glass detector.
  */
 internal object GlassCountingEngine {
     data class Result(
@@ -35,7 +22,7 @@ internal object GlassCountingEngine {
         val confidence: Float
     )
 
-    private const val MAX_WIDTH = 1400
+    private const val MAX_WIDTH = 1200
     private const val STRIP_COUNT = 13
     private const val MIN_STRIP_SUPPORT = 4
     private const val SLOPE_BINS = 49
@@ -45,13 +32,11 @@ internal object GlassCountingEngine {
     private data class Line(val intercept: Int, val slope: Float, val votes: Int)
 
     fun analyze(source: Bitmap): Result {
-        if (source.width < 80 || source.height < 100) return emptyResult()
-
+        if (source.width < 100 || source.height < 100) return emptyResult()
         val width = min(MAX_WIDTH, source.width)
-        val height = max(160, source.height * width / source.width)
+        val height = max(100, source.height * width / source.width)
         val image = if (width == source.width && height == source.height) source
             else Bitmap.createScaledBitmap(source, width, height, true)
-
         try {
             val top = height / 20
             val bottom = height * 19 / 20
@@ -72,8 +57,8 @@ internal object GlassCountingEngine {
                 stripEdges.add(detectHorizontalEdges(image, left, right, top, bottom))
             }
 
-            // Each local edge votes for all plausible line slopes. This allows
-            // the same physical, slightly tilted boundary to agree across strips.
+            // Hough-style voting aligns a tilted edge across strips instead
+            // of requiring every strip to report the exact same image row.
             for (strip in 0 until STRIP_COUNT) {
                 val xNorm = stripCenters[strip]
                 for (edge in stripEdges[strip]) {
@@ -85,61 +70,79 @@ internal object GlassCountingEngine {
                 }
             }
 
-            val minVotes = max(MIN_STRIP_SUPPORT, (STRIP_COUNT * 0.30f).toInt())
+            val minVotes = max(7, (STRIP_COUNT * 0.50f).toInt())
             val raw = ArrayList<Line>()
             for (s in 0 until SLOPE_BINS) {
                 val row = accumulator[s]
                 for (y in 2 until usableHeight - 2) {
                     val v = row[y]
-                    if (v < minVotes || v < row[y - 1] || v <= row[y + 1]) continue
-                    raw.add(Line(y, slopeAt(s, usableHeight), v))
+                    if (v >= minVotes && v >= row[y - 1] && v > row[y + 1]) {
+                        raw.add(Line(y, slopeAt(s, usableHeight), v))
+                    }
                 }
             }
 
-            // Non-maximum suppression in intercept/slope space prevents one
-            // physical boundary from being counted several times.
+            // Suppress duplicate slope/intercept hypotheses for one edge.
             val selected = ArrayList<Line>()
             for (candidate in raw.sortedByDescending { it.votes }) {
                 val duplicate = selected.any {
-                    abs(it.intercept - candidate.intercept) <= max(3, usableHeight / 180) &&
-                        abs(it.slope - candidate.slope) <= 0.035f
+                    abs(it.intercept - candidate.intercept) <= max(2, usableHeight / 500) &&
+                        abs(it.slope - candidate.slope) <= 0.015f * usableHeight
                 }
                 if (!duplicate) selected.add(candidate)
             }
 
-            // Refine support by checking how many distinct strips contain a
-            // nearby edge at the predicted y coordinate.
+            // Recheck each hypothesis against distinct strips; a reflection
+            // confined to one narrow area cannot become a full boundary.
             val supported = selected.mapNotNull { line ->
                 var support = 0
                 for (strip in 0 until STRIP_COUNT) {
                     val predicted = top + line.intercept + line.slope * stripCenters[strip]
-                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(3, usableHeight / 160) }) {
+                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(2, usableHeight / 400) }) {
                         support++
                     }
                 }
                 if (support >= minVotes) line.copy(votes = support) else null
             }.sortedBy { it.intercept }
 
-            // Collapse close parallel detections after refinement.
             val boundaries = ArrayList<Line>()
             for (line in supported) {
                 val previous = boundaries.lastOrNull()
-                if (previous == null || abs(previous.intercept - line.intercept) > max(4, usableHeight / 120)) {
+                if (previous == null || abs(previous.intercept - line.intercept) > max(3, usableHeight / 350)) {
                     boundaries.add(line)
                 } else if (line.votes > previous.votes) {
                     boundaries[boundaries.lastIndex] = line
                 }
             }
 
-            if (boundaries.size < 2) return Result(0, boundaries.size, 0, 0f)
+            // A physical glass edge can create two nearby gradient responses
+            // (both sides of a narrow dark/bright ridge). Estimate the normal
+            // interval from the complete gap distribution, then collapse only
+            // very short adjacent detections before converting boundaries to panels.
+            if (boundaries.size >= 3) {
+                val preliminaryGaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }
+                    .filter { it > 0 }.sorted()
+                val typicalGap = preliminaryGaps[preliminaryGaps.size / 2]
+                val duplicateGap = max(2, (typicalGap * 0.32f).toInt())
+                val compact = ArrayList<Line>()
+                for (line in boundaries) {
+                    val previous = compact.lastOrNull()
+                    if (previous == null || line.intercept - previous.intercept > duplicateGap) {
+                        compact.add(line)
+                    } else if (line.votes > previous.votes) {
+                        compact[compact.lastIndex] = line
+                    }
+                }
+                boundaries.clear()
+                boundaries.addAll(compact)
+            }
 
-            val gaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }
-                .filter { it > 0 }
+            if (boundaries.size < 2) return Result(0, boundaries.size, 0, 0f)
+            val gaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }.filter { it > 0 }
             val spacing = if (gaps.isEmpty()) 0 else gaps.sorted()[gaps.size / 2]
             val support = boundaries.map { it.votes.toFloat() / STRIP_COUNT }.average().toFloat()
             val confidence = (support * min(1f, boundaries.size / 8f)).coerceIn(0f, 1f)
 
-            // A panel occupies the interval between two consecutive boundaries.
             return Result(
                 count = (boundaries.size - 1).coerceAtMost(300),
                 detectedEdges = boundaries.size,
@@ -158,9 +161,8 @@ internal object GlassCountingEngine {
         yStart: Int,
         yEnd: Int
     ): List<Edge> {
-        val height = image.height
-        val profile = FloatArray(height)
-        val stepX = max(1, (xEnd - xStart) / 100)
+        val profile = FloatArray(image.height)
+        val stride = max(1, (xEnd - xStart) / 100)
         for (y in yStart + 2 until yEnd - 2) {
             var total = 0f
             var samples = 0
@@ -172,7 +174,7 @@ internal object GlassCountingEngine {
                 val nearBelow = luminance(image.getPixel(x, y + 1))
                 total += abs(below - above) * 0.7f + abs(nearBelow - nearAbove) * 0.3f
                 samples++
-                x += stepX
+                x += stride
             }
             profile[y] = if (samples == 0) 0f else total / samples
         }
