@@ -115,6 +115,28 @@ internal object GlassCountingEngine {
                 }
             }
 
+            // A physical glass edge can create two nearby gradient responses
+            // (both sides of a narrow dark/bright ridge). Estimate the normal
+            // interval from the complete gap distribution, then collapse only
+            // very short adjacent detections before converting boundaries to panels.
+            if (boundaries.size >= 3) {
+                val preliminaryGaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }
+                    .filter { it > 0 }.sorted()
+                val typicalGap = preliminaryGaps[preliminaryGaps.size / 2]
+                val duplicateGap = max(2, (typicalGap * 0.32f).toInt())
+                val compact = ArrayList<Line>()
+                for (line in boundaries) {
+                    val previous = compact.lastOrNull()
+                    if (previous == null || line.intercept - previous.intercept > duplicateGap) {
+                        compact.add(line)
+                    } else if (line.votes > previous.votes) {
+                        compact[compact.lastIndex] = line
+                    }
+                }
+                boundaries.clear()
+                boundaries.addAll(compact)
+            }
+
             if (boundaries.size < 2) return Result(0, boundaries.size, 0, 0f)
             val gaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }.filter { it > 0 }
             val spacing = if (gaps.isEmpty()) 0 else gaps.sorted()[gaps.size / 2]
