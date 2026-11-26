@@ -86,8 +86,8 @@ internal object GlassCountingEngine {
             val selected = ArrayList<Line>()
             for (candidate in raw.sortedByDescending { it.votes }) {
                 val duplicate = selected.any {
-                    abs(it.intercept - candidate.intercept) <= max(3, usableHeight / 180) &&
-                        abs(it.slope - candidate.slope) <= 0.035f * usableHeight
+                    abs(it.intercept - candidate.intercept) <= max(2, usableHeight / 500) &&
+                        abs(it.slope - candidate.slope) <= 0.015f * usableHeight
                 }
                 if (!duplicate) selected.add(candidate)
             }
@@ -98,7 +98,7 @@ internal object GlassCountingEngine {
                 var support = 0
                 for (strip in 0 until STRIP_COUNT) {
                     val predicted = top + line.intercept + line.slope * stripCenters[strip]
-                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(3, usableHeight / 160) }) {
+                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(2, usableHeight / 400) }) {
                         support++
                     }
                 }
@@ -108,7 +108,7 @@ internal object GlassCountingEngine {
             val boundaries = ArrayList<Line>()
             for (line in supported) {
                 val previous = boundaries.lastOrNull()
-                if (previous == null || abs(previous.intercept - line.intercept) > max(4, usableHeight / 120)) {
+                if (previous == null || abs(previous.intercept - line.intercept) > max(3, usableHeight / 350)) {
                     boundaries.add(line)
                 } else if (line.votes > previous.votes) {
                     boundaries[boundaries.lastIndex] = line
