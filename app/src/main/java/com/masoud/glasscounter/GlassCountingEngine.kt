@@ -70,7 +70,7 @@ internal object GlassCountingEngine {
                 }
             }
 
-            val minVotes = max(MIN_STRIP_SUPPORT, (STRIP_COUNT * 0.30f).toInt())
+            val minVotes = max(7, (STRIP_COUNT * 0.50f).toInt())
             val raw = ArrayList<Line>()
             for (s in 0 until SLOPE_BINS) {
                 val row = accumulator[s]
