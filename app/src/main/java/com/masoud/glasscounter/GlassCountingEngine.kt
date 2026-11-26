@@ -7,9 +7,12 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * Horizontal-boundary consensus prototype for vertically stacked glass.
- * A boundary is accepted only when independent image columns support it.
- * Count is the number of consecutive intervals between accepted boundaries.
+ * Slanted horizontal-boundary consensus for vertically stacked glass.
+ * Independent vertical strips vote for the same physical boundary in
+ * slope/intercept space. The reported count is the number of intervals
+ * between consecutive supported boundaries (N boundaries -> N-1 intervals).
+ *
+ * This remains a deterministic CV prototype, not a trained glass detector.
  */
 internal object GlassCountingEngine {
     data class Result(
@@ -20,8 +23,13 @@ internal object GlassCountingEngine {
     )
 
     private const val MAX_WIDTH = 1200
-    private const val STRIP_COUNT = 9
-    private const val MIN_STRIP_VOTES = 3
+    private const val STRIP_COUNT = 13
+    private const val MIN_STRIP_SUPPORT = 4
+    private const val SLOPE_BINS = 49
+    private const val MAX_SLOPE_FRACTION = 0.12f
+
+    private data class Edge(val y: Int, val strength: Float)
+    private data class Line(val intercept: Int, val slope: Float, val votes: Int)
 
     fun analyze(source: Bitmap): Result {
         if (source.width < 100 || source.height < 100) return emptyResult()
@@ -32,81 +40,154 @@ internal object GlassCountingEngine {
         try {
             val top = height / 20
             val bottom = height * 19 / 20
-            val votes = IntArray(height)
-            val strengths = FloatArray(height)
-            val radius = max(2, height / 500)
-            val stripWidth = max(1, (width * 9 / 10) / STRIP_COUNT)
+            val usableHeight = bottom - top
+            if (usableHeight < 80) return emptyResult()
+
+            val accumulator = Array(SLOPE_BINS) { IntArray(usableHeight) }
+            val stripEdges = ArrayList<List<Edge>>(STRIP_COUNT)
+            val stripCenters = FloatArray(STRIP_COUNT)
+
             for (strip in 0 until STRIP_COUNT) {
-                val x0 = width / 20 + strip * stripWidth
-                val x1 = min(width - 2, x0 + stripWidth)
-                val profile = FloatArray(height)
-                val stride = max(1, (x1 - x0) / 160)
-                for (y in top + 2 until bottom - 2) {
-                    var sum = 0f
-                    var n = 0
-                    var x = x0
-                    while (x < x1) {
-                        val a = lum(image.getPixel(x, y - 2))
-                        val b = lum(image.getPixel(x, y + 2))
-                        val c = lum(image.getPixel(x, y - 1))
-                        val d = lum(image.getPixel(x, y + 1))
-                        sum += abs(b - a) * 0.7f + abs(d - c) * 0.3f
-                        n++
-                        x += stride
+                val x0 = width * strip / STRIP_COUNT
+                val x1 = width * (strip + 1) / STRIP_COUNT
+                val inset = max(1, (x1 - x0) / 10)
+                val left = min(width - 2, x0 + inset)
+                val right = max(left + 1, x1 - inset)
+                stripCenters[strip] = ((left + right) * 0.5f / width - 0.5f) * 2f
+                stripEdges.add(detectHorizontalEdges(image, left, right, top, bottom))
+            }
+
+            // Hough-style voting aligns a tilted edge across strips instead
+            // of requiring every strip to report the exact same image row.
+            for (strip in 0 until STRIP_COUNT) {
+                val xNorm = stripCenters[strip]
+                for (edge in stripEdges[strip]) {
+                    for (s in 0 until SLOPE_BINS) {
+                        val slope = slopeAt(s, usableHeight)
+                        val intercept = (edge.y - top - slope * xNorm).toInt()
+                        if (intercept in 0 until usableHeight) accumulator[s][intercept]++
                     }
-                    profile[y] = if (n == 0) 0f else sum / n
-                }
-                val sorted = profile.sliceArray(top + 3 until bottom - 3).sorted()
-                if (sorted.isEmpty()) continue
-                val median = sorted[sorted.size / 2]
-                val deviations = sorted.map { abs(it - median) }.sorted()
-                val mad = deviations[deviations.size / 2]
-                val p78 = sorted[(sorted.size * 78 / 100).coerceIn(0, sorted.lastIndex)]
-                val threshold = max(median + max(1.2f, mad * 1.6f), p78)
-                val peaks = ArrayList<Int>()
-                for (y in top + 3 until bottom - 3) {
-                    if (profile[y] >= threshold && profile[y] >= profile[y - 1] && profile[y] > profile[y + 1]) {
-                        peaks.add(y)
-                    }
-                }
-                val chosen = ArrayList<Int>()
-                for (y in peaks.sortedByDescending { profile[it] }) {
-                    if (chosen.none { abs(it - y) <= radius }) chosen.add(y)
-                }
-                for (y in chosen) {
-                    val lo = max(top, y - radius)
-                    val hi = min(bottom - 1, y + radius)
-                    var best = y
-                    for (p in lo..hi) if (profile[p] > profile[best]) best = p
-                    votes[best]++
-                    strengths[best] += profile[best]
                 }
             }
 
-            val candidates = (top + 2 until bottom - 2).filter { y ->
-                votes[y] >= MIN_STRIP_VOTES && votes[y] >= votes[y - 1] && votes[y] > votes[y + 1]
-            }.sortedByDescending { votes[it] * 10000f + strengths[it] }
-            val accepted = ArrayList<Int>()
-            for (y in candidates) if (accepted.none { abs(it - y) <= radius * 2 }) accepted.add(y)
-            accepted.sort()
-            if (accepted.size < 2) return Result(0, accepted.size, 0, 0f)
+            val minVotes = max(MIN_STRIP_SUPPORT, (STRIP_COUNT * 0.30f).toInt())
+            val raw = ArrayList<Line>()
+            for (s in 0 until SLOPE_BINS) {
+                val row = accumulator[s]
+                for (y in 2 until usableHeight - 2) {
+                    val v = row[y]
+                    if (v >= minVotes && v >= row[y - 1] && v > row[y + 1]) {
+                        raw.add(Line(y, slopeAt(s, usableHeight), v))
+                    }
+                }
+            }
 
-            val gaps = accepted.zipWithNext { a, b -> b - a }.filter { it > radius * 3 }
+            // Suppress duplicate slope/intercept hypotheses for one edge.
+            val selected = ArrayList<Line>()
+            for (candidate in raw.sortedByDescending { it.votes }) {
+                val duplicate = selected.any {
+                    abs(it.intercept - candidate.intercept) <= max(3, usableHeight / 180) &&
+                        abs(it.slope - candidate.slope) <= 0.035f * usableHeight
+                }
+                if (!duplicate) selected.add(candidate)
+            }
+
+            // Recheck each hypothesis against distinct strips; a reflection
+            // confined to one narrow area cannot become a full boundary.
+            val supported = selected.mapNotNull { line ->
+                var support = 0
+                for (strip in 0 until STRIP_COUNT) {
+                    val predicted = top + line.intercept + line.slope * stripCenters[strip]
+                    if (stripEdges[strip].any { abs(it.y - predicted) <= max(3, usableHeight / 160) }) {
+                        support++
+                    }
+                }
+                if (support >= minVotes) line.copy(votes = support) else null
+            }.sortedBy { it.intercept }
+
+            val boundaries = ArrayList<Line>()
+            for (line in supported) {
+                val previous = boundaries.lastOrNull()
+                if (previous == null || abs(previous.intercept - line.intercept) > max(4, usableHeight / 120)) {
+                    boundaries.add(line)
+                } else if (line.votes > previous.votes) {
+                    boundaries[boundaries.lastIndex] = line
+                }
+            }
+
+            if (boundaries.size < 2) return Result(0, boundaries.size, 0, 0f)
+            val gaps = boundaries.zipWithNext { a, b -> b.intercept - a.intercept }.filter { it > 0 }
             val spacing = if (gaps.isEmpty()) 0 else gaps.sorted()[gaps.size / 2]
-            val support = accepted.map { votes[it].toFloat() / STRIP_COUNT }.average().toFloat()
-            val gapConsistency = if (gaps.size < 2 || spacing == 0) 0.35f else {
-                val deviations = gaps.map { abs(it - spacing).toFloat() / spacing }.average().toFloat()
-                (1f - deviations).coerceIn(0f, 1f)
-            }
-            val confidence = (support * 0.75f + gapConsistency * 0.25f).coerceIn(0f, 1f)
-            return Result((accepted.size - 1).coerceAtMost(300), accepted.size, spacing, confidence)
+            val support = boundaries.map { it.votes.toFloat() / STRIP_COUNT }.average().toFloat()
+            val confidence = (support * min(1f, boundaries.size / 8f)).coerceIn(0f, 1f)
+
+            return Result(
+                count = (boundaries.size - 1).coerceAtMost(300),
+                detectedEdges = boundaries.size,
+                pairSpacingPx = spacing,
+                confidence = confidence
+            )
         } finally {
             if (image !== source) image.recycle()
         }
     }
 
-    private fun lum(c: Int): Float =
-        Color.red(c) * 0.299f + Color.green(c) * 0.587f + Color.blue(c) * 0.114f
+    private fun detectHorizontalEdges(
+        image: Bitmap,
+        xStart: Int,
+        xEnd: Int,
+        yStart: Int,
+        yEnd: Int
+    ): List<Edge> {
+        val profile = FloatArray(image.height)
+        val stride = max(1, (xEnd - xStart) / 100)
+        for (y in yStart + 2 until yEnd - 2) {
+            var total = 0f
+            var samples = 0
+            var x = xStart
+            while (x < xEnd) {
+                val above = luminance(image.getPixel(x, y - 2))
+                val below = luminance(image.getPixel(x, y + 2))
+                val nearAbove = luminance(image.getPixel(x, y - 1))
+                val nearBelow = luminance(image.getPixel(x, y + 1))
+                total += abs(below - above) * 0.7f + abs(nearBelow - nearAbove) * 0.3f
+                samples++
+                x += stride
+            }
+            profile[y] = if (samples == 0) 0f else total / samples
+        }
+
+        val values = profile.sliceArray(yStart + 3 until yEnd - 3).sorted()
+        if (values.isEmpty()) return emptyList()
+        val median = values[values.size / 2]
+        val deviations = values.map { abs(it - median) }.sorted()
+        val mad = deviations[deviations.size / 2]
+        val p84 = values[(values.size * 84 / 100).coerceIn(0, values.lastIndex)]
+        val threshold = max(median + max(2.0f, mad * 2.0f), p84)
+
+        val peaks = ArrayList<Edge>()
+        for (y in yStart + 3 until yEnd - 3) {
+            if (profile[y] >= threshold &&
+                profile[y] >= profile[y - 1] &&
+                profile[y] > profile[y + 1]
+            ) peaks.add(Edge(y, profile[y]))
+        }
+
+        val chosen = ArrayList<Edge>()
+        val mergeDistance = max(2, image.height / 500)
+        for (edge in peaks.sortedByDescending { it.strength }) {
+            if (chosen.none { abs(it.y - edge.y) <= mergeDistance }) chosen.add(edge)
+        }
+        return chosen
+    }
+
+    private fun slopeAt(index: Int, usableHeight: Int): Float {
+        val fraction = index.toFloat() / (SLOPE_BINS - 1)
+        return (fraction * 2f - 1f) * MAX_SLOPE_FRACTION * usableHeight
+    }
+
+    private fun luminance(color: Int): Float =
+        Color.red(color) * 0.299f + Color.green(color) * 0.587f + Color.blue(color) * 0.114f
 
     private fun emptyResult() = Result(0, 0, 0, 0f)
 }
